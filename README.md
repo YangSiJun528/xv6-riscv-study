@@ -2,6 +2,12 @@
 
 MIT xv6-riscv를 기반으로 운영체제의 전체 흐름을 학습하기 위한 개인 저장소입니다.
 
+## 학습 자료
+
+- https://github.com/mit-pdos/xv6-riscv
+- https://xv6-guide.github.io/xv6-riscv-book
+- https://youtube.com/playlist?list=PLbtzT1TYeoMhTPzyTZboW_j7TPAnjv9XB
+
 ## macOS 환경 준비
 
 ```sh
