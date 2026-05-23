@@ -54,6 +54,11 @@ endif
 
 QEMU = qemu-system-riscv64
 MIN_QEMU_VERSION = 7.2
+CLANG_FORMAT ?= $(shell if command -v clang-format >/dev/null 2>&1; then \
+	command -v clang-format; \
+	elif xcrun --find clang-format >/dev/null 2>&1; then \
+	xcrun --find clang-format; \
+	else echo clang-format; fi)
 
 CC = $(TOOLPREFIX)gcc
 LD = $(TOOLPREFIX)ld
@@ -149,6 +154,10 @@ UPROGS=\
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)
 
+clion-index: $K/kernel fs.img
+
+all: clion-index
+
 -include kernel/*.d user/*.d
 
 clean: 
@@ -194,6 +203,6 @@ check-qemu-version:
 		exit 1; \
 	fi
 
-.PHONY: fmt
+.PHONY: all clion-index fmt
 fmt:
-	clang-format -i $(wildcard kernel/*.[ch] user/*.[ch] mkfs/*.c)
+	$(CLANG_FORMAT) -i $(wildcard kernel/*.[ch] user/*.[ch] mkfs/*.c)
