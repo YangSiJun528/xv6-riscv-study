@@ -3,195 +3,94 @@
 ## 읽는 순서
 
 - `docs/reference/scripts/ko/09-xv6-kernel-9-riscv-trap-processing-hSjJ94PoLXc.md`
-- `kernel/riscv.h`: `sstatus`, `stvec`, `sepc`, `scause`, delegation CSR
+- `kernel/riscv.h`: trap 관련 CSR
 - `kernel/trap.c`: user/kernel trap 처리
-- `kernel/kernelvec.S`, `kernel/trampoline.S`: low-level register save/restore
-- `kernel/start.c`: trap delegation, timer setup
+- `kernel/trampoline.S`, `kernel/kernelvec.S`: low-level entry/return
+- `kernel/start.c`: delegation, timer 설정
 
-## trap이란
+## trap의 의미
+
+RISC-V 문맥에서는 `trap`이 상위 개념이다.
 
 ```text
 trap = exception 또는 interrupt
 
 exception: 현재 instruction 때문에 동기적으로 발생
-  ecall, illegal instruction, page fault, access fault
+  예: ecall, illegal instruction, page fault, access fault
 
-interrupt: 외부 사건으로 비동기적으로 발생
-  timer, UART, virtio disk
+interrupt: 외부 사건 때문에 비동기적으로 발생
+  예: timer, UART, virtio disk
 ```
 
-## hardware가 하는 일
+trap이 발생하면 현재 실행 흐름을 잠시 멈추고 trap handler로 제어가 넘어간다.
+
+## hardware가 해주는 일
+
+trap 때 hardware가 모든 register를 저장해주지는 않는다. 최소한의 제어 정보만 CSR에 저장하고 handler로
+jump한다.
+
+- 현재 PC를 `sepc`에 저장
+- trap 원인을 `scause`에 저장
+- fault 주소 같은 부가 정보를 `stval`에 저장할 수 있음
+- 이전 privilege mode를 `sstatus.SPP`에 저장
+- 이전 interrupt enable 상태를 `sstatus.SPIE`에 저장
+- interrupt를 끄고 supervisor mode로 전환
+- `stvec`이 가리키는 handler로 jump
+
+일반 register 저장은 xv6의 assembly entry code가 직접 한다.
+
+## trap handler가 둘인 이유
+
+xv6는 trap이 어디서 났는지에 따라 다른 entry를 사용한다.
+
+- user mode에서 난 trap: `trampoline.S`의 `uservec`
+- kernel mode에서 난 trap: `kernelvec.S`의 `kernelvec`
+
+user mode에서 trap이 나면 user page table이 켜진 상태로 kernel에 들어오기 때문에 trampoline이 필요하다.
+trampoline은 user page table과 kernel page table 양쪽에서 같은 virtual address에 매핑되어 있어 page
+table 전환 중에도 실행될 수 있다.
+
+> [추가]  
+> trampoline = page table을 바꾸는 중에도 계속 실행될 수 있도록 
+> user page table과 kernel page table의 같은 virtual address에 매핑된 코드
+
+## user trap 흐름
 
 ```text
-trap 발생
-  -> 현재 pc를 sepc에 저장
-  -> 원인을 scause에 저장
-  -> 추가 fault 주소 등을 stval에 저장할 수 있음
-  -> 이전 privilege mode를 sstatus.SPP에 저장
-  -> interrupt enable 상태를 sstatus.SPIE에 저장
-  -> interrupt를 끄고 supervisor mode로 전환
-  -> stvec이 가리키는 handler로 jump
+user code 실행
+  -> syscall / interrupt / page fault
+  -> hardware가 sepc/scause/sstatus 등을 설정
+  -> stvec이 가리키는 uservec으로 jump
+  -> user register 전체를 trapframe에 저장
+  -> kernel page table로 전환
+  -> usertrap() 실행
+  -> 원인별 처리
+  -> trapframe과 CSR을 복귀용으로 준비
+  -> userret
+  -> user register 복원
+  -> sret로 user mode 복귀
 ```
 
-```c++
-// kernel/riscv.h
-#define SSTATUS_SPP  (1L << 8) // previous mode: 1=S, 0=U
-#define SSTATUS_SPIE (1L << 5) // previous interrupt enable
-#define SSTATUS_SIE  (1L << 1) // supervisor interrupt enable
+syscall은 `ecall` exception이다. 이때 `sepc`는 `ecall` 명령어 주소를 가리키므로, xv6는
+`trapframe->epc += 4` 해서 복귀 시 다음 instruction으로 가게 한다.
 
-static inline void w_stvec(uint64 x) { asm volatile("csrw stvec, %0" : : "r"(x)); }
-static inline void w_sepc(uint64 x)  { asm volatile("csrw sepc, %0" : : "r"(x)); }
-static inline uint64 r_scause()      { uint64 x; asm volatile("csrr %0, scause" : "=r"(x)); return x; }
-static inline uint64 r_stval()       { uint64 x; asm volatile("csrr %0, stval" : "=r"(x)); return x; }
-```
+## interrupt enable과 pending
 
-## trap vector 선택
+interrupt는 비동기 사건이라 interrupt enable bit의 영향을 받는다. 꺼져 있으면 즉시 handler로 가지 않고
+pending 상태로 남을 수 있다. 반면 exception은 현재 instruction 실행 결과이므로 interrupt enable과
+별개로 처리된다.
 
-```c++
-// kernel/trap.c
-void
-trapinithart(void)
-{
-  // kernel mode에서 난 trap은 kernelvec.S로 간다.
-  w_stvec((uint64)kernelvec);
-}
+xv6가 spinlock을 잡을 때 interrupt를 끄는 이유도 여기와 연결된다. 같은 CPU에서 interrupt handler가
+같은 lock을 다시 잡는 상황을 막기 위한 것이다.
 
-void
-prepare_return(void)
-{
-  intr_off();
+## delegation과 timer
 
-  // user mode에서 다음 trap이 나면 trampoline의 uservec으로 들어오게 한다.
-  uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
-  w_stvec(trampoline_uservec);
-}
-```
+RISC-V는 원래 trap을 machine mode에서 처리할 수 있지만, xv6는 대부분의 exception/interrupt를
+supervisor mode로 위임한다. 이를 위해 `medeleg`, `mideleg`를 초기화한다.
 
-`stvec`은 현재 상황에 맞게 바뀐다. kernel 안에서는 `kernelvec`, user로 돌아가기 전에는
-`uservec`을 가리킨다.
+강의는 machine timer interrupt가 `timervec`을 거쳐 supervisor software interrupt를 만든다고 설명한다.
+현재 repo는 Sstc 기반으로 supervisor timer interrupt를 직접 처리하는 경로라서 세부 구현이 다르다.
+큰 구조는 같지만 timer 부분은 현재 source 기준으로 봐야 한다.
 
-## user trap
-
-```c++
-uint64
-usertrap(void)
-{
-  if ((r_sstatus() & SSTATUS_SPP) != 0)
-    panic("usertrap: not from user mode");
-
-  // 이제 kernel 안이므로 kernel trap vector를 사용한다.
-  w_stvec((uint64)kernelvec);
-
-  struct proc *p = myproc();
-  p->trapframe->epc = r_sepc(); // user pc 저장
-
-  if (r_scause() == 8) {
-    // ecall은 4바이트 instruction이므로 다음 instruction으로 복귀한다.
-    p->trapframe->epc += 4;
-    intr_on();
-    syscall();
-  } else if (devintr() != 0) {
-    // device/timer interrupt
-  } else {
-    setkilled(p);
-  }
-
-  prepare_return();
-  return MAKE_SATP(p->pagetable); // trampoline.S userret에 전달
-}
-```
-
-## user로 돌아가기
-
-```c++
-void
-prepare_return(void)
-{
-  struct proc *p = myproc();
-
-  p->trapframe->kernel_satp = r_satp();
-  p->trapframe->kernel_sp = p->kstack + PGSIZE;
-  p->trapframe->kernel_trap = (uint64)usertrap;
-  p->trapframe->kernel_hartid = r_tp();
-
-  // sret가 user mode로 내려가게 준비한다.
-  unsigned long x = r_sstatus();
-  x &= ~SSTATUS_SPP; // previous mode = user
-  x |= SSTATUS_SPIE; // user mode에서 interrupt enable
-  w_sstatus(x);
-
-  w_sepc(p->trapframe->epc);
-}
-```
-
-```asm
-# kernel/trampoline.S
-userret:
-        # user page table로 전환한다.
-        csrw satp, a0
-        sfence.vma zero, zero
-
-        # trapframe에서 user register를 복원한다.
-        li a0, TRAPFRAME
-        ld ra, 40(a0)
-        ld sp, 48(a0)
-        ld a7, 168(a0)
-
-        # prepare_return()이 설정한 sstatus/sepc를 사용해 user mode로 복귀한다.
-        sret
-```
-
-## kernel trap
-
-```asm
-# kernel/kernelvec.S
-kernelvec:
-        addi sp, sp, -256
-        sd ra, 0(sp)
-        sd a0, 72(sp)
-        sd a7, 128(sp)
-
-        call kerneltrap
-
-        ld ra, 0(sp)
-        ld a0, 72(sp)
-        ld a7, 128(sp)
-        addi sp, sp, 256
-        sret
-```
-
-kernel trap은 이미 kernel stack 위에서 실행되므로, `kernelvec.S`가 필요한 caller-saved register를
-stack에 저장한 뒤 `kerneltrap()`을 호출한다.
-
-## timer interrupt 소스 대조
-
-강의는 machine `timervec`이 supervisor software interrupt를 만든다고 설명한다. 현재 소스에는
-`timervec`이 없고, Sstc 기반 supervisor timer interrupt를 직접 처리한다.
-
-```c++
-// kernel/trap.c
-void
-clockintr()
-{
-  if (cpuid() == 0) {
-    acquire(&tickslock);
-    ticks++;
-    wakeup(&ticks);
-    release(&tickslock);
-  }
-  w_stimecmp(r_time() + 1000000); // 다음 timer interrupt 예약
-}
-
-int
-devintr()
-{
-  if (r_scause() == 0x8000000000000005L) {
-    clockintr();
-    return 2;
-  }
-  return 0;
-}
-```
-
-trap의 큰 구조는 강의와 같지만, timer interrupt 구현은 현재 tree의 `stimecmp` 경로를 기준으로
-봐야 한다.
+코드 확인 위치:
+`kernel/riscv.h`, `kernel/start.c`, `kernel/trap.c`, `kernel/trampoline.S`, `kernel/kernelvec.S`

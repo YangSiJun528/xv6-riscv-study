@@ -85,6 +85,10 @@ start()
 
 ## CSR 접근
 
+CSR은 Control and Status Register의 약자다. 일반-purpose register와 달리 CPU의 제어 상태를
+읽고 쓰는 특수 register다. 예를 들어 현재 privilege mode, interrupt enable 여부, trap handler
+주소, trap 원인 같은 값을 담는다.
+
 ```c++
 // kernel/riscv.h
 static inline uint64

@@ -3,171 +3,87 @@
 ## 읽는 순서
 
 - `docs/reference/scripts/ko/10-xv6-kernel-10-context-switching-1sSanF_y8FY.md`
-- `kernel/proc.h`: `trapframe`, `context`
-- `kernel/proc.c`: `scheduler`, `sched`, `yield`
-- `kernel/swtch.S`: kernel thread context switch
+- `kernel/proc.h`: `trapframe`, `context`, process/CPU state
+- `kernel/proc.c`: scheduler, yield, sched
+- `kernel/swtch.S`: kernel context switch
 - `kernel/trampoline.S`, `kernel/trap.c`: user/kernel trap return
 
-## 두 종류의 전환
+## 핵심 그림
+
+사용자 프로그램은 계속 실행되는 것처럼 보이지만, 실제로는 timer interrupt, syscall, device interrupt,
+exception 때문에 user/kernel 경계를 자주 넘는다.
 
 ```text
-user <-> kernel 전환:
-  trap / sret
-  user register 전체와 user pc를 trapframe에 저장/복원
-
-kernel thread <-> scheduler 전환:
-  swtch()
-  kernel context의 callee-saved register만 context에 저장/복원
+user 실행
+  -> trap으로 kernel 진입
+  -> kernel 처리
+  -> 같은 process로 돌아가거나
+  -> scheduler를 거쳐 다른 process로 돌아감
 ```
 
-trap은 privilege mode를 바꾸지만, `swtch()`는 이미 kernel mode 안에서 kernel thread 실행 흐름만
-바꾼다.
+따라서 context switching을 이해하려면 두 종류의 전환을 구분해야 한다.
 
-## 저장되는 상태
+## 1. user/kernel 전환
 
-```c++
-// kernel/proc.h
-struct trapframe {
-  uint64 kernel_satp;
-  uint64 kernel_sp;
-  uint64 kernel_trap;
-  uint64 epc; // saved user pc
-  uint64 kernel_hartid;
+trap과 `sret`으로 일어나는 전환이다.
 
-  // user register 전체
-  uint64 ra;
-  uint64 sp;
-  uint64 gp;
-  uint64 tp;
-  uint64 a0;
-  uint64 a1;
-  uint64 a7;
-  /* ... */
-};
+- user mode에서 kernel mode로 들어온다.
+- user register 전체와 user PC를 `trapframe`에 저장한다.
+- 처리가 끝나면 `trapframe`에서 register를 복원하고 `sret`로 user mode에 돌아간다.
+- user program 입장에서는 interrupt가 끼어들었더라도 중단된 지점에서 계속 실행되는 것처럼 보인다.
 
-struct context {
-  uint64 ra;
-  uint64 sp;
+즉 `trapframe`은 user 실행 상태 저장소다.
 
-  // callee-saved register만 저장한다.
-  uint64 s0;
-  uint64 s1;
-  /* ... */
-  uint64 s11;
-};
-```
+## 2. kernel 내부 context switch
 
-`trapframe`은 user mode 재개용이고, `context`는 kernel thread가 scheduler와 오갈 때 쓰인다.
+이미 kernel mode 안에 들어온 뒤, 현재 process의 kernel 실행 흐름에서 scheduler 실행 흐름으로 바꾸거나
+반대로 돌아올 때 일어난다.
 
-## scheduler
+- `swtch(old, new)`가 담당한다.
+- 전체 register를 저장하지 않고 `ra`, `sp`, `s0-s11`만 저장/복원한다.
+- `p->context`는 process의 kernel 실행 상태다.
+- `cpu->context`는 해당 CPU의 scheduler 실행 상태다.
 
-```c++
-void
-scheduler(void)
-{
-  struct cpu *c = mycpu();
-  c->proc = 0;
+즉 `context`는 kernel 실행 상태 저장소다. `swtch()` 입장에서는 process인지 scheduler인지 구분하지 않고,
+현재 context를 저장하고 다음 context를 복원할 뿐이다.
 
-  for (;;) {
-    intr_on();
-    intr_off();
+## scheduler 관점
 
-    for (struct proc *p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        p->state = RUNNING;
-        c->proc = p;
-
-        // scheduler context -> process kernel context
-        swtch(&c->context, &p->context);
-
-        c->proc = 0;
-      }
-      release(&p->lock);
-    }
-  }
-}
-```
-
-각 CPU는 자기 scheduler loop를 돈다. 실행할 process를 찾으면 그 process의 kernel context로
-`swtch()`한다.
-
-## yield와 sched
-
-```c++
-void
-yield(void)
-{
-  struct proc *p = myproc();
-  acquire(&p->lock);
-  p->state = RUNNABLE;
-  sched();
-  release(&p->lock);
-}
-
-void
-sched(void)
-{
-  struct proc *p = myproc();
-
-  if (!holding(&p->lock))
-    panic("sched p->lock");
-  if (mycpu()->noff != 1)
-    panic("sched locks");
-  if (intr_get())
-    panic("sched interruptible");
-
-  // process kernel context -> scheduler context
-  swtch(&p->context, &mycpu()->context);
-}
-```
-
-timer interrupt에서 `yield()`가 호출되면 process는 `RUNNABLE`로 돌아가고 scheduler에게 CPU를
-넘긴다.
-
-## `swtch.S`
-
-```asm
-# void swtch(struct context *old, struct context *new)
-# a0 = old, a1 = new
-swtch:
-        # 현재 kernel context 저장
-        sd ra, 0(a0)
-        sd sp, 8(a0)
-        sd s0, 16(a0)
-        sd s1, 24(a0)
-        sd s11, 104(a0)
-
-        # 다음 kernel context 복원
-        ld ra, 0(a1)
-        ld sp, 8(a1)
-        ld s0, 16(a1)
-        ld s1, 24(a1)
-        ld s11, 104(a1)
-
-        # 복원된 ra로 돌아간다.
-        ret
-```
-
-`swtch()`는 `a`/`t` register를 저장하지 않는다. RISC-V calling convention상 caller-saved이고,
-`swtch()` 호출을 넘어서 보존해야 할 kernel state는 `context`에 있는 값으로 충분하다.
-
-## 전체 흐름
+각 CPU는 자기 scheduler loop를 가진다. scheduler는 runnable process를 찾고, 그 process의
+kernel context로 `swtch()`한다.
 
 ```text
-user process 실행
-  -> timer interrupt
-  -> trampoline.S/uservec가 user register를 trapframe에 저장
-  -> usertrap()
-  -> yield()
-  -> sched()
-  -> swtch(&p->context, &cpu->context)
-  -> scheduler()
-  -> 다른 RUNNABLE process 선택
-  -> swtch(&cpu->context, &next->context)
-  -> prepare_return() + trampoline.S/userret
-  -> sret로 user mode 재개
+scheduler
+  -> runnable process 선택
+  -> process의 kernel context로 swtch
+  -> process가 user mode로 복귀
+  -> timer/syscall 등으로 다시 kernel 진입
+  -> yield/sleep/wait 등에서 scheduler context로 swtch
 ```
 
-멀티코어에서는 각 CPU가 scheduler를 가진다. process 상태와 context는 shared memory에 있으므로
-`p->lock`으로 보호한다.
+timer interrupt가 들어오면 현재 process는 trap을 통해 kernel에 들어온다. 이후 xv6가 CPU를 넘기기로 하면
+`yield()`가 process를 `RUNNABLE`로 바꾸고 scheduler로 context switch한다.
+
+## multi-core에서 중요한 점
+
+process는 특정 CPU에 영구히 묶이지 않는다. 어떤 process가 CPU 0에서 실행되다가 나중에 CPU 1에서 다시
+실행될 수 있다.
+
+process의 실행 상태는 shared memory 안의 `trapframe`과 `context`에 저장된다. 여러 CPU가 같은 process를
+동시에 건드리면 안 되므로 process state와 context switch 주변은 lock으로 보호된다.
+
+## 정리
+
+```text
+일반 함수 호출:
+  C ABI가 register/stack 사용 규칙을 관리
+
+user/kernel 경계:
+  trapframe이 user register 전체와 user PC를 저장
+
+kernel scheduling 경계:
+  context가 kernel 실행 재개에 필요한 최소 register만 저장
+```
+
+코드 확인 위치:
+`kernel/proc.h`, `kernel/proc.c`, `kernel/swtch.S`, `kernel/trap.c`, `kernel/trampoline.S`

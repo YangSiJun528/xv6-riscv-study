@@ -3,157 +3,115 @@
 ## 읽는 순서
 
 - `docs/reference/scripts/ko/08-xv6-kernel-8-riscv-page-tables-g7B0WS5Xu-A.md`
-- `kernel/riscv.h`: Sv39, PTE bit, 주소 index macro
-- `kernel/vm.c`: kernel page table, walk, mappages
-- `kernel/memlayout.h`: physical/device address와 trampoline 위치
+- `kernel/riscv.h`: Sv39, PTE bit, `satp`, `sfence.vma`
+- `kernel/vm.c`: page table 생성, walk, mapping
+- `kernel/memlayout.h`: kernel/device/trampoline 주소 배치
 
-## Sv39 주소 구조
+## 핵심
+
+Page table은 virtual address를 physical address로 바꾸는 하드웨어 자료구조다. xv6는 RISC-V
+Sv39 방식을 사용하고, 초기화 이후 supervisor/user mode에서는 주소 변환이 항상 켜져 있다고 보면 된다.
+
+현재 hart가 사용할 page table root는 `satp` CSR이 가리킨다. `satp`가 0이면 주소 변환이 꺼져 있고,
+커널 초기화 후에는 kernel page table 또는 process별 user page table을 가리킨다.
+
+## page table이 여러 개인 이유
+
+- kernel page table
+  - 모든 CPU가 공유한다.
+  - 대부분 physical address와 virtual address를 같게 직접 매핑한다.
+  - RAM뿐 아니라 UART, virtio, PLIC 같은 memory-mapped device도 매핑한다.
+- user page table
+  - process마다 따로 있다.
+  - 각 process에게 독립된 virtual address space를 제공한다.
+  - `PTE_U`가 있는 page만 user mode에서 접근 가능하다.
+
+즉 page table은 주소 변환뿐 아니라 process isolation과 접근 권한 제어도 담당한다.
+
+## Sv39 구조
+
+Sv39의 virtual address는 실질적으로 39bit를 사용한다.
 
 ```text
-virtual address:
-
-  38              30 29              21 20              12 11          0
- +------------------+------------------+------------------+-------------+
- | level-2 index    | level-1 index    | level-0 index    | page offset |
- | 9 bits           | 9 bits           | 9 bits           | 12 bits     |
- +------------------+------------------+------------------+-------------+
-
-page size = 4096 bytes
-PTE count per page-table page = 512
+virtual address = level-2 index | level-1 index | level-0 index | page offset
+                    9 bits        9 bits          9 bits          12 bits
 ```
 
-```c++
-// kernel/riscv.h
-#define PGSIZE  4096
-#define PGSHIFT 12
+page size는 4KB라서 offset이 12bit다. 나머지 27bit는 9bit씩 나뉘어 3단계 page table을
+따라 내려가는 index로 쓰인다. 각 page-table page는 4KB이고, PTE 하나가 8byte라서 512개 entry를
+담는다.
 
-#define PXMASK         0x1FF
-#define PXSHIFT(level) (PGSHIFT + (9 * (level)))
-#define PX(level, va)  ((((uint64)(va)) >> PXSHIFT(level)) & PXMASK)
+## 주소와 PTE 해석
+
+### virtual address
+
+Page table walk의 입력이다. `L2/L1/L0` index로 PTE를 찾고, offset은 최종 주소에 그대로 붙는다.
+
+```text
+63        39 38        30 29        21 20        12 11         0
++-----------+------------+------------+------------+------------+
+| sign ext  | L2 index   | L1 index   | L0 index   | page offset|
+| 25 bits   | 9 bits     | 9 bits     | 9 bits     | 12 bits    |
++-----------+------------+------------+------------+------------+
 ```
 
-## PTE format
+### page table entry(PTE)
 
-```c++
-#define PTE_V (1L << 0) // valid
-#define PTE_R (1L << 1) // readable
-#define PTE_W (1L << 2) // writable
-#define PTE_X (1L << 3) // executable
-#define PTE_U (1L << 4) // user mode 접근 가능
+Page table page 안의 64bit entry다. PPN은 다음 page table page나 최종 physical page를 가리키고,
+flags는 접근 권한을 담는다.
 
-#define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
-#define PTE2PA(pte) (((pte) >> 10) << 12)
-#define PTE_FLAGS(pte) ((pte) & 0x3FF)
+```text
+63        54 53                                             10 9          0
++-----------+-------------------------------------------------+------------+
+| reserved  | PPN(Physical Page Number)                       | flags      |
+| 10 bits   | 44 bits                                         | 10 bits    |
++-----------+-------------------------------------------------+------------+
 ```
 
-CPU는 load/store/fetch 때 page table을 따라가고, leaf PTE의 `V/R/W/X/U` bit로 접근 가능 여부를
-검사한다. OS별 메모리 의미는 모르고, PTE bit만 본다.
+### physical address
 
-## `satp`와 TLB
+Page table walk의 결과다. PTE의 PPN과 virtual address의 offset을 합쳐 만든다.
 
-```c++
-#define SATP_SV39 (8L << 60)
-#define MAKE_SATP(pagetable) (SATP_SV39 | (((uint64)pagetable) >> 12))
-
-void
-kvminithart()
-{
-  sfence_vma();                    // 이전 page table write 정리
-  w_satp(MAKE_SATP(kernel_pagetable)); // 현재 hart의 page table 선택
-  sfence_vma();                    // stale TLB 제거
-}
+```text
+63        56 55        30 29        21 20        12 11         0
++-----------+-------------------------------------------------+------------+
+| unused    | PPN(Physical Page Number)                       | page offset|
+| 8 bits    | 44 bits                                         | 12 bits    |
++-----------+-------------------------------------------------+------------+
 ```
 
-`satp`가 현재 hart의 page table root를 가리킨다. `satp`를 바꾸면 TLB에 남은 옛 변환을 버리기 위해
-`sfence.vma`가 필요하다.
+정리하면 `virtual address index -> PTE 선택 -> PTE의 PPN + 원래 offset -> physical address` 흐름이다.
 
-## kernel page table
+## PTE가 담는 것
 
-```c++
-pagetable_t
-kvmmake(void)
-{
-  pagetable_t kpgtbl = (pagetable_t)kalloc();
-  memset(kpgtbl, 0, PGSIZE);
+PTE(Page Table Entry)는 다음 두 종류의 정보를 담는다.
 
-  // MMIO device 직접 매핑
-  kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
-  kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
-  kvmmap(kpgtbl, PLIC, PLIC, 0x4000000, PTE_R | PTE_W);
+- 다음 level page table 또는 최종 physical page의 주소
+- 접근 권한 bit
+  - `V`: valid
+  - `R`: read
+  - `W`: write
+  - `X`: execute
+  - `U`: user mode 접근 허용
 
-  // kernel text는 read/execute, data/RAM은 read/write
-  kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
-  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext,
-         PTE_R | PTE_W);
+CPU는 load/store/instruction fetch 때 page table walk를 수행하고, leaf PTE의 권한 bit를 검사한다.
+OS가 의도한 "코드", "데이터", "user memory" 같은 의미는 모르고 PTE bit만 본다.
 
-  // trap entry/return 코드
-  kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+## TLB와 `sfence.vma`
 
-  proc_mapstacks(kpgtbl);
-  return kpgtbl;
-}
-```
+Page table walk는 메모리 접근을 여러 번 해야 하므로 느리다. 그래서 CPU는 최근 변환 결과를 TLB에
+캐시한다.
 
-kernel page table은 모든 CPU가 공유한다. 대부분 physical address와 같은 virtual address로 직접
-매핑한다.
+문제는 page table이나 `satp`를 바꾼 뒤에도 TLB에 옛 변환이 남을 수 있다는 점이다. xv6는 page table
+전환 전후에 `sfence.vma`를 실행해서 stale TLB entry를 버린다.
 
-## page table walk
+## xv6에서 중요하게 볼 점
 
-```c++
-pte_t *
-walk(pagetable_t pagetable, uint64 va, int alloc)
-{
-  if (va >= MAXVA)
-    panic("walk");
+- `kvmmake()`는 kernel page table을 만든다.
+- `walk()`는 Sv39의 3단계 page table을 따라 내려간다.
+- `mappages()`는 virtual page와 physical page의 mapping을 추가한다.
+- `walkaddr()`는 user pointer가 실제 user page인지 확인할 때 쓰인다.
+- trampoline은 user page table과 kernel page table 양쪽에서 같은 virtual address에 매핑되어야 한다.
 
-  for (int level = 2; level > 0; level--) {
-    pte_t *pte = &pagetable[PX(level, va)];
-    if (*pte & PTE_V) {
-      pagetable = (pagetable_t)PTE2PA(*pte);
-    } else {
-      if (!alloc || (pagetable = (pde_t *)kalloc()) == 0)
-        return 0;
-      memset(pagetable, 0, PGSIZE);
-      *pte = PA2PTE(pagetable) | PTE_V;
-    }
-  }
-  return &pagetable[PX(0, va)];
-}
-```
-
-`walk()`는 level 2 -> 1 -> 0 순서로 내려간다. `alloc`이 true이면 빠진 중간 page-table page를
-새로 만든다.
-
-## mapping 추가와 user 확인
-
-```c++
-int
-mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
-{
-  uint64 a = va;
-  uint64 last = va + size - PGSIZE;
-
-  for (;;) {
-    pte_t *pte = walk(pagetable, a, 1);
-    if (*pte & PTE_V)
-      panic("mappages: remap");
-    *pte = PA2PTE(pa) | perm | PTE_V;
-
-    if (a == last)
-      break;
-    a += PGSIZE;
-    pa += PGSIZE;
-  }
-}
-
-uint64
-walkaddr(pagetable_t pagetable, uint64 va)
-{
-  pte_t *pte = walk(pagetable, va, 0);
-  if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
-    return 0;
-  return PTE2PA(*pte);
-}
-```
-
-`walkaddr()`는 user page만 물리 주소로 바꾼다. `PTE_U`가 없으면 user pointer로 인정하지 않는다.
+코드 확인 위치:
+`kernel/riscv.h`, `kernel/vm.c`, `kernel/memlayout.h`
