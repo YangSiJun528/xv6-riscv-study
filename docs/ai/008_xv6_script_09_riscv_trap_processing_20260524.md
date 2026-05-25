@@ -51,7 +51,7 @@ trampoline은 user page table과 kernel page table 양쪽에서 같은 virtual a
 table 전환 중에도 실행될 수 있다.
 
 > [추가]  
-> trampoline = page table을 바꾸는 중에도 계속 실행될 수 있도록 
+> trampoline: page table을 바꾸는 중에도 계속 실행될 수 있도록 
 > user page table과 kernel page table의 같은 virtual address에 매핑된 코드
 
 ## user trap 흐름
