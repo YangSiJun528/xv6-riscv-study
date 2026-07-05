@@ -8,6 +8,9 @@ MIT xv6-riscv를 기반으로 운영체제의 전체 흐름을 학습하기 위�
 - https://xv6-guide.github.io/xv6-riscv-book
 - https://youtube.com/playlist?list=PLbtzT1TYeoMhTPzyTZboW_j7TPAnjv9XB
 
+추가 자료 (POSIX Call, Network programming 등)
+- https://cs341.cs.illinois.edu/coursebook/Processes#file-descriptors
+
 ## macOS 환경 준비
 
 ```sh
